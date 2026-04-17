@@ -1,0 +1,150 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    - name: Ensure dependency packages are installed
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    # 1. Networking Setup (Pre-flight fix)
+    - name: Load kernel modules for Kubernetes
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Set sysctl parameters for networking
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Persist modules on boot
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+
+    # 2. Kubernetes Repository Setup (New pkgs.k8s.io)
+    - name: Create directory for keyring
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes GPG key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        state: present
+        update_cache: yes
+
+    # 3. Disable Swap
+    - name: Disable swap immediately
+      command: swapoff -a
+      ignore_errors: true
+
+    - name: Remove swap entry from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '(^.*swap.*$)'
+        replace: '# \1'
+
+    # 4. Install and Configure Containerd
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Generate default containerd config and enable SystemdCgroup
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      notify: Restart containerd
+
+    # 5. Install K8s Tools
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Mark Kubernetes packages on hold
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+  handlers:
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+- hosts: master
+  become: true
+  tasks:
+    - name: Reset Kubernetes (if previous attempt failed)
+      command: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      register: kubeadm_init
+
+    - name: Setup kubeconfig for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0700
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        remote_src: yes
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: 0644
+
+    - name: Generate join command for workers
+      command: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: Set join command as a fact
+      set_fact:
+        worker_join_cmd: "{{ join_command_raw.stdout }}"
+
+- hosts: workers
+  become: true
+  tasks:
+    - name: Join worker nodes to the cluster
+      command: "{{ hostvars[groups['master'][0]]['worker_join_cmd'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
